@@ -2,6 +2,7 @@ import os
 import json
 from PIL import Image
 import cv2
+from progress.bar import Bar
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -53,21 +54,29 @@ class BDDFlow(FlowSpec):
         self.train_images = []
         self.val_images = []
 
-        # Load and preprocess training images
-        for annotation in self.train_annotations:
-            image_path = annotation['name']
-            image_id = image_path.split('.')[0]
-            image = Image.open(os.path.join(self.IMAGES_PATH, 'train', image_path)).convert('RGB')
-            image = np.array(image)
-            self.train_images.append((image, annotation))
+        try:
+            with Bar('Processing Training Images...') as bar:
+                # Load and preprocess training images
+                for annotation in self.train_annotations:
+                    image_path = annotation['name']
+                    image_id = image_path.split('.')[0]
+                    image = Image.open(os.path.join(self.IMAGES_PATH, 'train', image_path)).convert('RGB')
+                    image = np.array(image)
+                    self.train_images.append((image, annotation))
+                    bar.next()
 
-        # Load and preprocess validation images
-        for annotation in self.val_annotations:
-            image_path = annotation['name']
-            image_id = image_path.split('.')[0]
-            image = Image.open(os.path.join(self.IMAGES_PATH, 'val', image_path)).convert('RGB')
-            image = np.array(image)
-            self.val_images.append((image, annotation))
+            with Bar('Processing Val Images...') as bar:
+                # Load and preprocess validation images
+                for annotation in self.val_annotations:
+                    image_path = annotation['name']
+                    image_id = image_path.split('.')[0]
+                    image = Image.open(os.path.join(self.IMAGES_PATH, 'val', image_path)).convert('RGB')
+                    image = np.array(image)
+                    self.val_images.append((image, annotation))
+                    bar.next()
+        except Exception as e:
+            print(f'Error during image preprocessing: {e}')
+            raise
 
         print(f"Preprocessed {len(self.train_images)} training images.")
         print(f"Preprocessed {len(self.val_images)} validation images.")

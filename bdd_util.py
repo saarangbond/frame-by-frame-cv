@@ -1,7 +1,5 @@
 import torch
 from torch.utils.data import Dataset
-import cv2
-import os
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 import json
