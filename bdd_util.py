@@ -3,6 +3,11 @@ from torch.utils.data import Dataset
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 import json
+import numpy as np
+from tqdm import tqdm
+from PIL import Image
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 
 class BDD100KDataset(Dataset):
     def __init__(self, images, annotations, transforms=None):
@@ -24,6 +29,26 @@ class BDD100KDataset(Dataset):
             image = self.transforms(image)
         return image, target
 
+
+def process_annotations(annotations, image_dir):
+    processed_images = []
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(process_image, annotation['name'], image_dir): annotation for annotation in annotations}
+        for future in tqdm(as_completed(futures), total=len(futures), desc='Processing Images'):
+            image, image_path = future.result()
+            if image is not None:
+                processed_images.append((image, futures[future]))
+            else:
+                print(f"Failed to process {image_path}")
+    return processed_images
+
+def process_image(image_path, image_dir):
+    try:
+        image = Image.open(os.path.join(image_dir, image_path)).convert('RGB')
+        return np.array(image), image_path  # Return the image and its path for debugging
+    except Exception as e:
+        print(f"Error processing {image_path}: {e}")
+        return None, image_path
 
 def calculate_map(predictions, targets):
         """

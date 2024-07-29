@@ -1,17 +1,13 @@
 import os
 import json
-from PIL import Image
-import cv2
-from progress.bar import Bar
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 import torchvision.transforms as T
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
-from metaflow import FlowSpec, step, Parameter, catch
-from bdd_util import (BDD100KDataset, calculate_map)
+from metaflow import FlowSpec, step, Parameter, catch, resources
+from bdd_util import (BDD100KDataset, calculate_map, process_annotations)
 
 class BDDFlow(FlowSpec):
 
@@ -47,47 +43,25 @@ class BDDFlow(FlowSpec):
 
         print(f"Loaded {len(self.train_annotations)} training annotations.")
         print(f"Loaded {len(self.val_annotations)} validation annotations.")
-        self.next(self.process_training_images)
+        self.next(self.load_images)
 
     @catch(var='img_process_error')
+    @resources(memory=16000, cpu=4)
     @step
-    def process_training_images(self):
+    def load_images(self):
         self.train_images = []
+        self.val_images = []
         
         try:
-            with Bar('Processing Training Images...') as bar:
-                # Load and preprocess training images
-                for annotation in self.train_annotations:
-                    image_path = annotation['name']
-                    image = Image.open(os.path.join(self.IMAGES_PATH, 'train', image_path)).convert('RGB')
-                    image = np.array(image)
-                    self.train_images.append((image, annotation))
-                    bar.next()
+            # Load and preprocess training images
+            self.train_images = process_annotations(self.train_annotations, os.path.join(self.IMAGES_PATH, 'train'))
+            # Load and preprocess validation images
+            self.val_images = process_annotations(self.val_annotations, os.path.join(self.IMAGES_PATH, 'val'))
         except Exception as e:
             print(f'Error during image preprocessing: {e}')
             raise
 
         print(f"Preprocessed {len(self.train_images)} training images.")
-        self.next(self.process_validation_images)
-
-    @catch(var='img_process_error')
-    @step
-    def process_validation_images(self):
-        self.val_images = []
-
-        try:
-            with Bar('Processing Val Images...') as bar:
-                # Load and preprocess validation images
-                for annotation in self.val_annotations:
-                    image_path = annotation['name']
-                    image = Image.open(os.path.join(self.IMAGES_PATH, 'val', image_path)).convert('RGB')
-                    image = np.array(image)
-                    self.val_images.append((image, annotation))
-                    bar.next()
-        except Exception as e:
-            print(f'Error during image preprocessing: {e}')
-            raise
-
         print(f"Preprocessed {len(self.val_images)} validation images.")
         self.next(self.train_model)
 
