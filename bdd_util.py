@@ -1,37 +1,33 @@
 import torch
+from torch.utils.data import Dataset
 import cv2
 import os
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 import json
 
-def load_image_and_annotation(image_path, annotation_path):
-    image = cv2.imread(image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    
-    with open(annotation_path, 'r') as file:
-        lines = file.readlines()
-    
-    boxes = []
-    labels = []
-    for line in lines:
-        parts = line.strip().split()
-        x1, y1, x2, y2, label = map(float, parts[:4]) + [int(parts[4])]
-        boxes.append([x1, y1, x2, y2])
-        labels.append(label)
-    
-    boxes = torch.as_tensor(boxes, dtype=torch.float32)
-    labels = torch.as_tensor(labels, dtype=torch.int64)
-    target = {"boxes": boxes, "labels": labels}
-    
-    return image, target
+class BDD100KDataset(Dataset):
+    def __init__(self, images, annotations, transforms=None):
+        self.images = images
+        self.annotations = annotations
+        self.transforms = transforms
 
-def get_image_annotation_pairs(data_dir):
-    files = [f for f in os.listdir(data_dir) if f.endswith(".jpg")]
-    pairs = [(os.path.join(data_dir, file), os.path.join(data_dir, file.replace(".jpg", ".txt"))) for file in files]
-    return pairs
+    def __len__(self):
+        return len(self.images)
 
-def calculate_map(self, predictions, targets):
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        annotation = self.annotations[idx]
+        target = {
+            'boxes': torch.as_tensor([obj['bbox'] for obj in annotation['labels']], dtype=torch.float32),
+            'labels': torch.as_tensor([obj['category_id'] for obj in annotation['labels']], dtype=torch.int64)
+        }
+        if self.transforms:
+            image = self.transforms(image)
+        return image, target
+
+
+def calculate_map(predictions, targets):
         """
         Calculate Mean Average Precision (mAP) for the predictions using pycocotools.
         """
