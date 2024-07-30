@@ -21,46 +21,25 @@ class BDD100KDataset(Dataset):
     def __getitem__(self, idx):
         image = self.images[idx]
         annotation = self.annotations[idx]
-        
-        boxes = []
-        labels = []
-        cat_mapping = {
-            'pedestrian': 1,
-            'car': 2,
-            'truck': 3,
-            'bus': 4,
-            'traffic light': 5,
-            'traffic sign': 6,
-            'rider': 7,
-            'train': 8,
-            'motorcycle': 9,
-            'bicycle': 10,
-
-        }
-
-        for obj in annotation['labels']:
-            box = obj['box2d']
-            boxes.append([box['x1'], box['y1'], box['x2'], box['y2']])
-            labels.append(cat_mapping[obj['category']])
-        
         target = {
-            'boxes': torch.as_tensor(boxes, dtype=torch.float32),
-            'labels': torch.as_tensor(labels, dtype=torch.int64)
+            'boxes': torch.as_tensor([obj['bbox'] for obj in annotation['labels']], dtype=torch.float32),
+            'labels': torch.as_tensor([obj['category_id'] for obj in annotation['labels']], dtype=torch.int64)
         }
-        
         if self.transforms:
             image = self.transforms(image)
-        
         return image, target
+
 
 def process_annotations(annotations, image_dir):
     processed_images = []
-    for annotation in tqdm(annotations, desc='Processing Images'):
-        image, image_path = process_image(annotation['name'], image_dir)
-        if image is not None:
-            processed_images.append(image)
-        else:
-            print(f"Failed to process {image_path}")
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(process_image, annotation['name'], image_dir): annotation for annotation in annotations}
+        for future in tqdm(as_completed(futures), total=len(futures), desc='Processing Images'):
+            image, image_path = future.result()
+            if image is not None:
+                processed_images.append((image, futures[future]))
+            else:
+                print(f"Failed to process {image_path}")
     return processed_images
 
 def process_image(image_path, image_dir):
