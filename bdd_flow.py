@@ -1,4 +1,4 @@
-from metaflow import FlowSpec, step, Parameter, catch, kubernetes, card, current, pypi_base
+from metaflow import FlowSpec, step, Parameter, kubernetes, card, current, pypi_base
 from metaflow.cards import Markdown, Image, Artifact
 
 @pypi_base(python='3.11.9', packages={
@@ -167,6 +167,8 @@ class BDDFlow(FlowSpec):
                     self.val_annotations.append(ann_obj['annotation'])
         self.next(self.train_model)
 
+    
+    #@kubernetes(memory=16000, shared_memory=1024)
     @kubernetes(memory=16000, shared_memory=1024, gpu=1)
     @step
     def train_model(self):
@@ -232,7 +234,8 @@ class BDDFlow(FlowSpec):
         self.model = model
         self.next(self.evaluate_model)
 
-    @kubernetes(memory=16000, shared_memory=1024)
+    #@kubernetes(memory=16000, shared_memory=1024)
+    @kubernetes(memory=16000, shared_memory=1024, gpu=1)
     @step
     def evaluate_model(self):
         import torch
@@ -240,6 +243,7 @@ class BDDFlow(FlowSpec):
         import torchvision.transforms as T
         import numpy as np
         from mapcalc import calculate_map
+        import cv2
         from bdd_util import BDD100KDataset
 
         model = self.model
@@ -251,6 +255,7 @@ class BDDFlow(FlowSpec):
         val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=self.NUM_WORKERS, collate_fn=lambda x: tuple(zip(*x)))
 
         mAP_scores = []
+        self.sample_images = []
 
         # Evaluation loop
         with torch.no_grad():
@@ -258,7 +263,7 @@ class BDDFlow(FlowSpec):
                 images = list(image.to(device) for image in images)
                 outputs = model(images)
                 
-                for output in outputs:
+                for i, output in enumerate(outputs):
                     pred_object = {
                         'boxes': output['boxes'].cpu().numpy(),
                         'labels': output['labels'].cpu().numpy(),
@@ -272,15 +277,24 @@ class BDDFlow(FlowSpec):
                     }
 
                 mAP_scores.append(calculate_map(pred_object, target_object, 0.5))
+                # Save sample images
+                if len(self.sample_images) < 9:
+                    image = images[i].cpu().numpy().transpose(1, 2, 0)
+                    image = (image * 255).astype(np.uint8)
+                    for box in pred_object['boxes']:
+                        cv2.rectangle(image, (box[0], box[1]), (box[2], box[3]), (255, 0, 0), 2)
+                    for box in target_object['boxes']:
+                        cv2.rectangle(image, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+                    self.sample_images.append(image)
                 
         self.mAP = np.mean(mAP_scores)
 
         print("Evaluation complete.")
-        self.next(self.end)
+        self.next(self.render_card)
 
     @card
     @step
-    def end(self):
+    def render_card(self):
         import io
         import numpy as np
         import matplotlib.pyplot as plt
@@ -311,6 +325,26 @@ class BDDFlow(FlowSpec):
 
         img_buf.close()
 
+        # Render grid of sample images
+        fig, axs = plt.subplots(3, 3, figsize=(15, 15))
+        for i, ax in enumerate(axs.flat):
+            ax.imshow(self.sample_images[i])
+            ax.axis('off')
+
+        grid_buf = io.BytesIO()
+        plt.savefig(grid_buf, format='png')
+        grid_img = Img.open(grid_buf).convert('RGB')
+
+        current.card.append(Markdown('# Sample Predictions'))
+        current.card.append(Markdown('The predictions are in red while the ground truth is in green.'))
+        current.card.append(Image.from_pil_image(grid_img))
+
+        grid_buf.close()
+
+        self.next(self.end)
+
+    @step
+    def end(self):
         print(f'Mean Average Precision (mAP): {self.mAP}')
         print("Object detection pipeline completed successfully.")
 
