@@ -1,18 +1,16 @@
-from metaflow import FlowSpec, step, Parameter, catch, kubernetes, card, current, pypi_base
+import os
+import json
+import torch
+from torch.utils.data import DataLoader
+import torchvision.transforms as T
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+import numpy as np
+from mapcalc import calculate_map
 
-@pypi_base(python='3.11.9', packages={
-    'torch': '2.4.0',
-    'torchvision': '0.19.0',
-    'pandas': '2.2.0',
-    'numpy': '1.24.3',
-    'scikit-learn': '1.5.1',
-    'matplotlib': '3.9.1',
-    'opencv-python-headless': '4.10.0.84',
-    'tqdm': '4.66.4',
-    'pillow': '10.4.0',
-    'mapcalc': '0.2.2',
-    'metaflow-card-html': '1.0.2'
-})
+from metaflow import FlowSpec, step, Parameter, catch, resources
+from bdd_util import (BDD100KDataset, calculate_map, process_annotations)
+
 class BDDFlow(FlowSpec):
 
     IMAGES_PATH = Parameter(
@@ -63,10 +61,6 @@ class BDDFlow(FlowSpec):
 
     @step
     def load_annotations(self):
-        import os
-        import json
-        import numpy as np
-
         # Load the JSON annotations
         with open(os.path.join(self.ANN_PATH, 'det_train.json'), 'r') as f:
             self.train_annotations = json.load(f)
@@ -120,9 +114,6 @@ class BDDFlow(FlowSpec):
 
     @step
     def load_images(self):
-        import os
-        from bdd_util import process_annotations
-
         ann_object = self.input
         ann_type = ann_object['type']
         annotations = ann_object['annotations']
@@ -160,23 +151,16 @@ class BDDFlow(FlowSpec):
                     self.val_annotations.append(ann_obj['annotation'])
         self.next(self.train_model)
 
-    @kubernetes(memory=16000, shared_memory=1024)
+    @resources(shared_memory=512)
     @step
     def train_model(self):
-        import torch
-        from torch.utils.data import DataLoader
-        import torchvision.transforms as T
-        from torchvision.models.detection import fasterrcnn_resnet50_fpn
-        from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-        from bdd_util import BDD100KDataset
-
         # Create datasets and dataloaders
         train_dataset = BDD100KDataset(self.train_images, self.train_annotations, transforms=T.ToTensor())
         val_dataset = BDD100KDataset(self.val_images, self.val_annotations, transforms=T.ToTensor())
         train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=self.NUM_WORKERS, collate_fn=lambda x: tuple(zip(*x)))
 
-        # Load a pretrained model and modify it for our dataset
-        model = fasterrcnn_resnet50_fpn(pretrained=True)
+        # Initialize a model without pre-trained weights
+        model = fasterrcnn_resnet50_fpn(pretrained=False)
         #num_classes = len(set([label['category'] for annotation in self.train_annotations for label in annotation['labels']])) + 1  # Assuming labels start from 1
         num_classes = 10 + 1
         in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -190,11 +174,8 @@ class BDDFlow(FlowSpec):
         optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
-        self.epoch_metrics = []
-
         # Training loop
         num_epochs = self.EPOCHS
-        epoch_loss = 0
         for epoch in range(num_epochs):
             model.train()
             i = 0
@@ -209,32 +190,19 @@ class BDDFlow(FlowSpec):
                 losses.backward()
                 optimizer.step()
 
-                epoch_loss += losses.item()
                 if i % 100 == 0:
                     print(f"Epoch: {epoch}, Iteration: {i}, Loss: {losses.item()}")
                 i += 1
 
             lr_scheduler.step()
-            epoch_loss /= len(train_loader)
-            self.epoch_metrics.append({
-                'epoch': epoch,
-                'loss': epoch_loss,
-            })
             print(f"Epoch {epoch} finished")
 
         self.model = model
         self.next(self.evaluate_model)
 
-    @kubernetes(memory=16000, shared_memory=1024)
+    @resources(shared_memory=512)
     @step
     def evaluate_model(self):
-        import torch
-        from torch.utils.data import DataLoader
-        import torchvision.transforms as T
-        import numpy as np
-        from mapcalc import calculate_map
-        from bdd_util import BDD100KDataset
-
         model = self.model
         model.eval()
         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -243,69 +211,24 @@ class BDDFlow(FlowSpec):
         val_dataset = BDD100KDataset(self.val_images, self.val_annotations, transforms=T.ToTensor())
         val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=self.NUM_WORKERS, collate_fn=lambda x: tuple(zip(*x)))
 
-        mAP_scores = []
+        all_predictions = []
+        all_targets = []
 
         # Evaluation loop
         with torch.no_grad():
             for images, targets in val_loader:
                 images = list(image.to(device) for image in images)
                 outputs = model(images)
-                
-                for output in outputs:
-                    pred_object = {
-                        'boxes': output['boxes'].cpu().numpy(),
-                        'labels': output['labels'].cpu().numpy(),
-                        'scores': output['scores'].cpu().numpy()
-                    }
+                all_predictions.extend(outputs)
+                all_targets.extend(targets)
 
-                for target in targets:
-                    target_object = {
-                        'boxes': target['boxes'].cpu().numpy(),
-                        'labels': target['labels'].cpu().numpy()
-                    }
-
-                mAP_scores.append(calculate_map(pred_object, target_object, 0.5))
-                
-        self.mAP = np.mean(mAP_scores)
+        self.mAP = calculate_map(all_predictions, all_targets, 0.5)
 
         print("Evaluation complete.")
         self.next(self.end)
 
-    @card(type='html')
     @step
     def end(self):
-        import io
-        import base64
-        import matplotlib.pyplot as plt
-
-        # Create plot
-        epochs = [m['epoch'] for m in self.epoch_metrics]
-        losses = [m['loss'] for m in self.epoch_metrics]
-        plt.figure(figsize=(10, 5))
-        plt.plot(epochs, losses, marker='o', linestyle='-', color='b')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training Loss Over Epochs')
-        plt.grid(True)
-
-        # Save plot to a PNG in memory
-        img_buf = io.BytesIO()
-        plt.savefig(img_buf, format='png')
-        img_buf.seek(0)
-        img_base64 = base64.b64encode(img_buf.read()).decode('utf-8')
-        img_html = f'<img src="data:image/png;base64,{img_base64}" />'
-
-        # Generate HTML content
-        html_content = f"""
-        <h1>Training Metrics</h1>
-        <p>Mean Average Precision (mAP): {self.mAP}</p>
-        <h2>Training Loss Over Epochs</h2>
-        {img_html}
-        """
-
-        # Assign the HTML content to the card
-        current.card.append(html_content)
-
         print(f'Mean Average Precision (mAP): {self.mAP}')
         print("Object detection pipeline completed successfully.")
 
