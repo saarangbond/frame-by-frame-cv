@@ -1,5 +1,5 @@
 from metaflow import FlowSpec, step, Parameter, kubernetes, card, current, pypi_base
-from metaflow.cards import Markdown, Image, Artifact
+from metaflow.cards import Markdown, Image, Artifact, ProgressBar, VegaChart
 
 @pypi_base(python='3.11.9', packages={
     'torch': '2.4.0',
@@ -12,7 +12,7 @@ from metaflow.cards import Markdown, Image, Artifact
     'tqdm': '4.66.4',
     'pillow': '10.4.0',
     'mapcalc': '0.2.2',
-    'metaflow-card-html': '1.0.2'
+    'altair': '5.2.0'
 })
 class BDDFlow(FlowSpec):
 
@@ -167,7 +167,7 @@ class BDDFlow(FlowSpec):
                     self.val_annotations.append(ann_obj['annotation'])
         self.next(self.train_model)
 
-    
+    @card(type='blank', refresh_interval=0.1)
     #@kubernetes(memory=16000, shared_memory=1024)
     @kubernetes(memory=16000, shared_memory=1024, gpu=1)
     @step
@@ -177,6 +177,8 @@ class BDDFlow(FlowSpec):
         import torchvision.transforms as T
         from torchvision.models.detection import fasterrcnn_resnet50_fpn
         from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+        import altair as alt
+        import pandas as pd
         from bdd_util import BDD100KDataset
 
         # Create datasets and dataloaders
@@ -199,14 +201,27 @@ class BDDFlow(FlowSpec):
         optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
-        self.epoch_metrics = []
+        self.epoch_metrics = pd.DataFrame({'epoch': [], 'loss': []})
+        alt_chart = (
+            alt.Chart(self.epoch_metrics, title=alt.TitleParams('Loss vs Epoch', anchor='middle'))
+            .mark_line(color='red', point=True)
+            .encode(x="epoch", y="loss")
+            .interactive()
+        )
+        chart = VegaChart.from_altair_chart(alt_chart)
+        current.card.append(chart)
+        current.card.refresh()
+
+        progressbar = ProgressBar(max=(self.EPOCHS*len(train_dataset)), label='Training Progress')
+        current.card.append(progressbar)
+        current.card.refresh()
 
         # Training loop
         num_epochs = self.EPOCHS
-        epoch_loss = 0
         for epoch in range(num_epochs):
             model.train()
             i = 0
+            epoch_loss = 0
             for images, targets in train_loader:
                 images = list(image.to(device) for image in images)
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -222,15 +237,24 @@ class BDDFlow(FlowSpec):
                 if i % 100 == 0:
                     print(f"Epoch: {epoch}, Iteration: {i}, Loss: {losses.item()}")
                 i += 1
+                progressbar.update(epoch*len(train_dataset)+i)
+                current.card.refresh()
 
             lr_scheduler.step()
-            epoch_loss /= len(train_loader)
-            self.epoch_metrics.append({
-                'epoch': epoch,
-                'loss': epoch_loss,
-            })
-            print(f"Epoch {epoch} finished")
+            epoch_loss /= i
+            new_row = pd.DataFrame({'epoch': [epoch], 'loss': [epoch_loss]})
+            self.epoch_metrics = pd.concat([self.epoch_metrics, new_row], ignore_index=True)
+            alt_chart = (
+                alt.Chart(self.epoch_metrics, title=alt.TitleParams('Loss vs Epoch', anchor='middle'))
+                .mark_line(color='red', point=True)
+                .encode(x="epoch", y="loss")
+                .interactive()
+            )
+            chart.update(alt_chart.to_dict())
+            current.card.refresh()
+            print(f"Epoch {epoch} finished.")
 
+        progressbar.update(self.EPOCHS*len(train_dataset))
         self.model = model
         self.next(self.evaluate_model)
 
@@ -281,10 +305,11 @@ class BDDFlow(FlowSpec):
                 if len(self.sample_images) < 9:
                     image = images[i].cpu().numpy().transpose(1, 2, 0)
                     image = (image * 255).astype(np.uint8)
+                    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
                     for box in pred_object['boxes']:
-                        cv2.rectangle(image, (box[0], box[1]), (box[2], box[3]), (255, 0, 0), 2)
+                        cv2.rectangle(image, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (255, 0, 0), 2)
                     for box in target_object['boxes']:
-                        cv2.rectangle(image, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+                        cv2.rectangle(image, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 2)
                     self.sample_images.append(image)
                 
         self.mAP = np.mean(mAP_scores)
@@ -300,43 +325,28 @@ class BDDFlow(FlowSpec):
         import matplotlib.pyplot as plt
         from PIL import Image as Img
 
-        # Create plot
-        epochs = [m['epoch'] for m in self.epoch_metrics]
-        losses = [m['loss'] for m in self.epoch_metrics]
-        plt.figure(figsize=(10, 5))
-        plt.plot(epochs, losses, marker='o', linestyle='-', color='b')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training Loss Over Epochs')
-        plt.xticks(np.arange(0, self.EPOCHS, 1.0))
-        plt.grid(True)
-
-        img_buf = io.BytesIO()
-        plt.savefig(img_buf, format='png')
-
-        plot_img = Img.open(img_buf).convert('RGB')
-
         #Populate card content
         current.card.append(Markdown('# Training Metrics'))
         current.card.append(Markdown('Mean Average Precision (mAP):'))
         current.card.append(Artifact(self.mAP))
-        current.card.append(Markdown('# Visualize Training Loss Over Epochs'))
-        current.card.append(Image.from_pil_image(plot_img))
 
-        img_buf.close()
+        num_images = len(self.sample_images)
+        grid_size = int(np.ceil(np.sqrt(num_images)))
 
         # Render grid of sample images
-        fig, axs = plt.subplots(3, 3, figsize=(15, 15))
-        for i, ax in enumerate(axs.flat):
-            ax.imshow(self.sample_images[i])
+        fig, axs = plt.subplots(grid_size, grid_size, figsize=(20,20))
+        axs = axs.flatten()
+        for i, ax in enumerate(axs):
+            if(i < num_images):
+                ax.imshow(self.sample_images[i])
             ax.axis('off')
 
         grid_buf = io.BytesIO()
-        plt.savefig(grid_buf, format='png')
+        plt.savefig(grid_buf, format='png', dpi=100)
         grid_img = Img.open(grid_buf).convert('RGB')
 
         current.card.append(Markdown('# Sample Predictions'))
-        current.card.append(Markdown('The predictions are in red while the ground truth is in green.'))
+        current.card.append(Markdown('The predictions are displayed in red while the ground truth is displayed in green.'))
         current.card.append(Image.from_pil_image(grid_img))
 
         grid_buf.close()
@@ -347,7 +357,6 @@ class BDDFlow(FlowSpec):
     def end(self):
         print(f'Mean Average Precision (mAP): {self.mAP}')
         print("Object detection pipeline completed successfully.")
-
 
 if __name__ == '__main__':
     BDDFlow()
