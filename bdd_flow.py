@@ -1,4 +1,5 @@
 from metaflow import FlowSpec, step, Parameter, catch, kubernetes, card, current, pypi_base
+from metaflow.cards import Markdown, Image, Artifact
 
 @pypi_base(python='3.11.9', packages={
     'torch': '2.4.0',
@@ -55,6 +56,12 @@ class BDDFlow(FlowSpec):
         'cap', type=int,
         default=None,
         help="Cap the number of training images to run this flow on"
+    )
+
+    PRETRAINED = Parameter(
+        'pretrained', type=bool,
+        default=True,
+        help="Whether to use a pretrained cv model or not."
     )
 
     @step
@@ -160,7 +167,7 @@ class BDDFlow(FlowSpec):
                     self.val_annotations.append(ann_obj['annotation'])
         self.next(self.train_model)
 
-    @kubernetes(memory=16000, shared_memory=1024)
+    @kubernetes(memory=16000, shared_memory=1024, gpu=1)
     @step
     def train_model(self):
         import torch
@@ -176,7 +183,7 @@ class BDDFlow(FlowSpec):
         train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=self.NUM_WORKERS, collate_fn=lambda x: tuple(zip(*x)))
 
         # Load a pretrained model and modify it for our dataset
-        model = fasterrcnn_resnet50_fpn(pretrained=True)
+        model = fasterrcnn_resnet50_fpn(pretrained=self.PRETRAINED)
         #num_classes = len(set([label['category'] for annotation in self.train_annotations for label in annotation['labels']])) + 1  # Assuming labels start from 1
         num_classes = 10 + 1
         in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -271,12 +278,13 @@ class BDDFlow(FlowSpec):
         print("Evaluation complete.")
         self.next(self.end)
 
-    @card(type='html')
+    @card
     @step
     def end(self):
         import io
-        import base64
+        import numpy as np
         import matplotlib.pyplot as plt
+        from PIL import Image as Img
 
         # Create plot
         epochs = [m['epoch'] for m in self.epoch_metrics]
@@ -286,25 +294,22 @@ class BDDFlow(FlowSpec):
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.title('Training Loss Over Epochs')
+        plt.xticks(np.arange(0, self.EPOCHS, 1.0))
         plt.grid(True)
 
-        # Save plot to a PNG in memory
         img_buf = io.BytesIO()
         plt.savefig(img_buf, format='png')
-        img_buf.seek(0)
-        img_base64 = base64.b64encode(img_buf.read()).decode('utf-8')
-        img_html = f'<img src="data:image/png;base64,{img_base64}" />'
 
-        # Generate HTML content
-        html_content = f"""
-        <h1>Training Metrics</h1>
-        <p>Mean Average Precision (mAP): {self.mAP}</p>
-        <h2>Training Loss Over Epochs</h2>
-        {img_html}
-        """
+        plot_img = Img.open(img_buf).convert('RGB')
 
-        # Assign the HTML content to the card
-        current.card.append(html_content)
+        #Populate card content
+        current.card.append(Markdown('# Training Metrics'))
+        current.card.append(Markdown('Mean Average Precision (mAP):'))
+        current.card.append(Artifact(self.mAP))
+        current.card.append(Markdown('# Visualize Training Loss Over Epochs'))
+        current.card.append(Image.from_pil_image(plot_img))
+
+        img_buf.close()
 
         print(f'Mean Average Precision (mAP): {self.mAP}')
         print("Object detection pipeline completed successfully.")
